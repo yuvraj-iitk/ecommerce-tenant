@@ -12,6 +12,10 @@ class UserCreate(BaseModel):
     tenant_id: int | None = None
     role_id: int    
 
+class SignupCreate(BaseModel):
+    username: str
+    password: str
+
 class ProductCreate(BaseModel):
     name: str
     category: str
@@ -28,6 +32,8 @@ class OrderCreate(BaseModel):
     user_id: int
     items: list[OrderItemCreate]
 
+class MyOrderCreate(BaseModel):
+    items: list[OrderItemCreate]
 
 class OrderItemResponse(BaseModel):
     product_id: int

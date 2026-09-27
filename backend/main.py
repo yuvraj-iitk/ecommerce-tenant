@@ -1,28 +1,321 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+
 from auth import get_current_user, require_role
 from keycloak_admin import create_keycloak_user, delete_keycloak_user
 
 from database import engine, Base, SessionLocal
 from models import Tenant, Role, User, Product, Order, OrderItem
-from schemas import TenantCreate, RoleCreate, UserCreate, ProductCreate , OrderCreate,OrderResponse
+
+from schemas import (
+    TenantCreate,
+    RoleCreate,
+    UserCreate,
+    SignupCreate,
+    ProductCreate,
+    OrderCreate,
+    OrderResponse,
+    MyOrderCreate
+)
+
+
+# =========================
+# DATABASE
+# =========================
 
 Base.metadata.create_all(bind=engine)
 
+
+# =========================
+# FASTAPI APP
+# =========================
+
 app = FastAPI()
+
+
+# =========================
+# CORS
+# =========================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =========================
+# DATABASE SESSION
+# =========================
 
 def get_db():
     db = SessionLocal()
+
     try:
         yield db
+
     finally:
         db.close()
 
+
+# =========================
+# HOME
+# =========================
+
 @app.get("/")
 def home():
-    return {"message": "E-commerce API is working"}
+    return {
+        "message": "E-commerce API is working"
+    }
 
-#  Post Tenant
+
+# =========================================================
+# TENANTS
+# =========================================================
+
+# ADMIN ONLY
+# Create a new tenant / brand
+
+@app.post("/tenants")
+def create_tenant(
+    tenant: TenantCreate,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_role("admin"))
+):
+    # Check duplicate tenant
+    existing_tenant = db.query(Tenant).filter(
+        Tenant.name == tenant.name
+    ).first()
+
+    if existing_tenant:
+        raise HTTPException(
+            status_code=400,
+            detail="Tenant already exists"
+        )
+
+    new_tenant = Tenant(
+        name=tenant.name
+    )
+
+    db.add(new_tenant)
+    db.commit()
+    db.refresh(new_tenant)
+
+    return new_tenant
+
+
+# Get all tenants
+
+@app.get("/tenants")
+def get_tenants(
+    db: Session = Depends(get_db)
+):
+    return db.query(Tenant).all()
+
+
+# ADMIN ONLY
+# Delete tenant / brand
+# Deletes tenant users, their orders, order items,
+# products and finally the tenant.
+
+@app.delete("/tenants/{tenant_id}")
+def delete_tenant(
+    tenant_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_role("admin"))
+):
+    # 1. Find tenant
+    tenant = db.query(Tenant).filter(
+        Tenant.id == tenant_id
+    ).first()
+
+    if not tenant:
+        raise HTTPException(
+            status_code=404,
+            detail="Tenant not found"
+        )
+
+    # 2. Find all users belonging to this tenant
+    users = db.query(User).filter(
+        User.tenant_id == tenant_id
+    ).all()
+
+    # 3. Delete tenant users from Keycloak and local database
+    for user in users:
+
+        # Don't delete admin users accidentally
+        role = db.query(Role).filter(
+            Role.id == user.role_id
+        ).first()
+
+        if role and role.name == "admin":
+            continue
+
+        try:
+            delete_keycloak_user(user.username)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not delete Keycloak user {user.username}: {str(e)}"
+            )
+
+        # Find user's orders
+        orders = db.query(Order).filter(
+            Order.user_id == user.id
+        ).all()
+
+        # Delete order items first
+        for order in orders:
+            db.query(OrderItem).filter(
+                OrderItem.order_id == order.id
+            ).delete(
+                synchronize_session=False
+            )
+
+        # Delete orders
+        db.query(Order).filter(
+            Order.user_id == user.id
+        ).delete(
+            synchronize_session=False
+        )
+
+        # Delete local user
+        db.delete(user)
+
+    # 4. Delete all products of this tenant
+    db.query(Product).filter(
+        Product.tenant_id == tenant_id
+    ).delete(
+        synchronize_session=False
+    )
+
+    # 5. Delete tenant
+    db.delete(tenant)
+
+    db.commit()
+
+    return {
+        "message": "Tenant deleted successfully",
+        "tenant_id": tenant_id
+    }
+
+# =========================================================
+# ROLES
+# =========================================================
+
+# ADMIN ONLY
+
+@app.post("/roles")
+def create_role(
+    r: RoleCreate,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_role("admin"))
+):
+    existing_role = db.query(Role).filter(
+        Role.name == r.name
+    ).first()
+
+    if existing_role:
+        raise HTTPException(
+            status_code=400,
+            detail="Role already exists"
+        )
+
+    x = Role(
+        name=r.name
+    )
+
+    db.add(x)
+    db.commit()
+    db.refresh(x)
+
+    return x
+
+
+# ADMIN ONLY
+
+@app.get("/roles")
+def get_roles(
+    db: Session = Depends(get_db),
+    current_user=Depends(require_role("admin"))
+):
+    return db.query(Role).all()
+
+
+# =========================================================
+# PUBLIC SIGNUP
+# =========================================================
+
+@app.post("/signup")
+def signup(
+    data: SignupCreate,
+    db: Session = Depends(get_db)
+):
+    # Check username already exists locally
+    existing_user = db.query(User).filter(
+        User.username == data.username
+    ).first()
+
+    if existing_user:
+        raise HTTPException(
+            status_code=400,
+            detail="Username already exists"
+        )
+
+    # Get normal user role
+    user_role = db.query(Role).filter(
+        Role.name == "user"
+    ).first()
+
+    if not user_role:
+        raise HTTPException(
+            status_code=500,
+            detail="User role not found"
+        )
+
+    # Create user in Keycloak
+    try:
+        create_keycloak_user(
+            data.username,
+            data.password,
+            "user"
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
+
+    # Create user in local database
+    new_user = User(
+        username=data.username,
+        tenant_id=None,
+        role_id=user_role.id
+    )
+
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    return {
+        "message": "Signup successful",
+        "username": new_user.username
+    }
+
+# =========================================================
+# USERS
+# =========================================================
+
+# ADMIN ONLY
+# Admin creates tenant users / normal users
+
 @app.post("/users")
 def create_user(
     u: UserCreate,
@@ -30,6 +323,7 @@ def create_user(
     current_user=Depends(require_role("admin"))
 ):
     # 1. Check username already exists locally
+
     existing_user = db.query(User).filter(
         User.username == u.username
     ).first()
@@ -41,6 +335,7 @@ def create_user(
         )
 
     # 2. Check role
+
     role = db.query(Role).filter(
         Role.id == u.role_id
     ).first()
@@ -51,15 +346,18 @@ def create_user(
             detail="Role not found"
         )
 
-    # 3. Tenant user must have a tenant
+    # 3. Tenant user must have tenant
+
     if role.name == "tenant" and u.tenant_id is None:
         raise HTTPException(
             status_code=400,
             detail="Tenant user must be linked to a tenant"
         )
 
-    # 4. Check tenant
+    # 4. Check tenant exists
+
     if u.tenant_id is not None:
+
         tenant = db.query(Tenant).filter(
             Tenant.id == u.tenant_id
         ).first()
@@ -71,18 +369,24 @@ def create_user(
             )
 
     # 5. Create user in Keycloak
+
     try:
+
         create_keycloak_user(
             u.username,
-            u.password
+            u.password,
+            role.name
         )
+
     except Exception as e:
+
         raise HTTPException(
             status_code=400,
             detail=str(e)
         )
 
     # 6. Create user in local database
+
     user = User(
         username=u.username,
         tenant_id=u.tenant_id,
@@ -96,101 +400,94 @@ def create_user(
     return user
 
 
-# get Tenant
-@app.get("/tenants")
-def get_tenants(db: Session = Depends(get_db)):
-    return db.query(Tenant).all()
+# ADMIN ONLY
 
-# post roles
-@app.post("/roles")
-def create_role(r: RoleCreate, db: Session = Depends(get_db)):
-    x = Role(name=r.name)
-    db.add(x)
-    db.commit()
-    db.refresh(x)
-    return x
-
-# get roles
-@app.get("/roles")
-def get_roles(db: Session = Depends(get_db)):
-    return db.query(Role).all()
-
-# post users
-@app.post("/users")
-def create_user(
-    u: UserCreate,
+@app.get("/users")
+def get_users(
     db: Session = Depends(get_db),
     current_user=Depends(require_role("admin"))
 ):
-    # Check username already exists
-    existing_user = db.query(User).filter(
-        User.username == u.username
-    ).first()
-
-    if existing_user:
-        raise HTTPException(
-            status_code=400,
-            detail="Username already exists"
-        )
-
-    # Check role exists
-    role = db.query(Role).filter(
-        Role.id == u.role_id
-    ).first()
-
-    if not role:
-        raise HTTPException(
-            status_code=404,
-            detail="Role not found"
-        )
-
-    # If user is a tenant user, tenant must be provided
-    if role.name == "tenant" and u.tenant_id is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Tenant user must be linked to a tenant"
-        )
-
-    # Check tenant exists
-    if u.tenant_id is not None:
-        tenant = db.query(Tenant).filter(
-            Tenant.id == u.tenant_id
-        ).first()
-
-        if not tenant:
-            raise HTTPException(
-                status_code=404,
-                detail="Tenant not found"
-            )
-
-    # Create user
-    user = User(
-        username=u.username,
-        tenant_id=u.tenant_id,
-        role_id=u.role_id
-    )
-
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-
-    return user
-
-# get users
-@app.get("/users")
-def get_users(db: Session = Depends(get_db)):
     return db.query(User).all()
 
-# post products
+
+# ADMIN ONLY
+# Delete user
+
+@app.delete("/users/{user_id}")
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_role("admin"))
+):
+    # Find local user
+
+    user = db.query(User).filter(
+        User.id == user_id
+    ).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    # Don't allow admin to delete admin user
+
+    role = db.query(Role).filter(
+        Role.id == user.role_id
+    ).first()
+
+    if role and role.name == "admin":
+        raise HTTPException(
+            status_code=400,
+            detail="Admin user cannot be deleted"
+        )
+
+    # Delete from Keycloak
+
+    try:
+
+        delete_keycloak_user(
+            user.username
+        )
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(e)
+        )
+
+    # Delete from local database
+
+    db.delete(user)
+    db.commit()
+
+    return {
+        "message": "User deleted successfully",
+        "username": user.username
+    }
+
+
+# =========================================================
+# PRODUCTS
+# =========================================================
+
+# TENANT ONLY
+# Create product for own tenant
+
 @app.post("/products")
 def create_product(
     p: ProductCreate,
     db: Session = Depends(get_db),
     current_user=Depends(require_role("tenant"))
 ):
-    # Keycloak username se local database user find karo
+    # Find local user using Keycloak username
+
     local_user = db.query(User).filter(
-        User.username == current_user.get("preferred_username")
+        User.username == current_user.get(
+            "preferred_username"
+        )
     ).first()
 
     if not local_user:
@@ -199,14 +496,16 @@ def create_product(
             detail="User not found in local database"
         )
 
-    # Tenant user ke paas tenant hona zaroori hai
+    # Tenant user must have tenant
+
     if local_user.tenant_id is None:
         raise HTTPException(
             status_code=400,
             detail="User is not linked to any tenant"
         )
 
-    # User sirf apne tenant ke liye product create kar sakta hai
+    # User can only create product for own tenant
+
     if p.tenant_id != local_user.tenant_id:
         raise HTTPException(
             status_code=403,
@@ -227,14 +526,19 @@ def create_product(
 
     return x
 
-# get my products
+
+# TENANT ONLY
+# Get own products
+
 @app.get("/my-products")
 def get_my_products(
     db: Session = Depends(get_db),
     current_user=Depends(require_role("tenant"))
 ):
     local_user = db.query(User).filter(
-        User.username == current_user.get("preferred_username")
+        User.username == current_user.get(
+            "preferred_username"
+        )
     ).first()
 
     if not local_user:
@@ -255,7 +559,10 @@ def get_my_products(
 
     return products
 
-# update my product
+
+# TENANT ONLY
+# Update own product
+
 @app.put("/products/{product_id}")
 def update_product(
     product_id: int,
@@ -264,7 +571,9 @@ def update_product(
     current_user=Depends(require_role("tenant"))
 ):
     local_user = db.query(User).filter(
-        User.username == current_user.get("preferred_username")
+        User.username == current_user.get(
+            "preferred_username"
+        )
     ).first()
 
     if not local_user:
@@ -289,7 +598,8 @@ def update_product(
             detail="Product not found"
         )
 
-    # Tenant can update only its own product
+    # Tenant can update only own product
+
     if product.tenant_id != local_user.tenant_id:
         raise HTTPException(
             status_code=403,
@@ -306,7 +616,10 @@ def update_product(
 
     return product
 
-# delete my product
+
+# TENANT ONLY
+# Delete own product
+
 @app.delete("/products/{product_id}")
 def delete_product(
     product_id: int,
@@ -314,7 +627,9 @@ def delete_product(
     current_user=Depends(require_role("tenant"))
 ):
     local_user = db.query(User).filter(
-        User.username == current_user.get("preferred_username")
+        User.username == current_user.get(
+            "preferred_username"
+        )
     ).first()
 
     if not local_user:
@@ -339,7 +654,8 @@ def delete_product(
             detail="Product not found"
         )
 
-    # Tenant can delete only its own product
+    # Tenant can delete only own product
+
     if product.tenant_id != local_user.tenant_id:
         raise HTTPException(
             status_code=403,
@@ -354,7 +670,10 @@ def delete_product(
         "product_id": product_id
     }
 
-# update product stock
+
+# TENANT ONLY
+# Update stock
+
 @app.put("/products/{product_id}/stock")
 def update_stock(
     product_id: int,
@@ -363,7 +682,9 @@ def update_stock(
     current_user=Depends(require_role("tenant"))
 ):
     local_user = db.query(User).filter(
-        User.username == current_user.get("preferred_username")
+        User.username == current_user.get(
+            "preferred_username"
+        )
     ).first()
 
     if not local_user:
@@ -388,7 +709,8 @@ def update_stock(
             detail="Product not found"
         )
 
-    # Tenant can update stock only for its own product
+    # Tenant can update stock only for own product
+
     if product.tenant_id != local_user.tenant_id:
         raise HTTPException(
             status_code=403,
@@ -412,12 +734,60 @@ def update_stock(
         "quantity": product.quantity
     }
 
-# get products
-@app.get("/products")
-def get_products(db: Session = Depends(get_db)):
-    return db.query(Product).all()
 
-# get tenant name products
+# =========================================================
+# ALL PRODUCTS
+# =========================================================
+
+@app.get("/products")
+def get_products(
+    search: str | None = None,
+    category: str | None = None,
+    page: int = 1,
+    limit: int = 10,
+    db: Session = Depends(get_db)
+):
+    if page < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Page must be greater than 0"
+        )
+
+    if limit < 1 or limit > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="Limit must be between 1 and 100"
+        )
+
+    q = db.query(Product)
+
+    # Search by product name
+
+    if search:
+        q = q.filter(
+            Product.name.ilike(
+                f"%{search}%"
+            )
+        )
+
+    # Filter by category
+
+    if category:
+        q = q.filter(
+            Product.category == category
+        )
+
+    products = q.offset(
+        (page - 1) * limit
+    ).limit(limit).all()
+
+    return products
+
+
+# =========================================================
+# TENANT LEVEL PRODUCTS
+# =========================================================
+
 @app.get("/{tenant_name}/products")
 def get_tenant_products(
     tenant_name: str,
@@ -427,35 +797,73 @@ def get_tenant_products(
     limit: int = 10,
     db: Session = Depends(get_db)
 ):
-    t = db.query(Tenant).filter(
+    if page < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Page must be greater than 0"
+        )
+
+    if limit < 1 or limit > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="Limit must be between 1 and 100"
+        )
+
+    tenant = db.query(Tenant).filter(
         Tenant.name == tenant_name
     ).first()
 
-    if not t:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    if not tenant:
+        raise HTTPException(
+            status_code=404,
+            detail="Tenant not found"
+        )
 
-    q = db.query(Product).filter(Product.tenant_id == t.id)
+    q = db.query(Product).filter(
+        Product.tenant_id == tenant.id
+    )
 
     if search:
-        q = q.filter(Product.name.ilike(f"%{search}%"))
+        q = q.filter(
+            Product.name.ilike(
+                f"%{search}%"
+            )
+        )
 
     if category:
-        q = q.filter(Product.category == category)
+        q = q.filter(
+            Product.category == category
+        )
 
-    products = q.offset((page - 1) * limit).limit(limit).all()
+    products = q.offset(
+        (page - 1) * limit
+    ).limit(limit).all()
 
     return products
 
 
-# post orders
+# =========================================================
+# ORDERS
+# =========================================================
+
+# Create order using user_id
+# Logged-in user can only order for himself
+
 @app.post("/orders")
 def create_order(
     o: OrderCreate,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user)
 ):
-    # 1. Check user role
-    roles = current_user.get("realm_access", {}).get("roles", [])
+    # Check user role
+
+    roles = current_user.get(
+        "realm_access",
+        {}
+    ).get(
+        "roles",
+        []
+    )
 
     if "user" not in roles and "tenant" not in roles:
         raise HTTPException(
@@ -463,7 +871,8 @@ def create_order(
             detail="Only users and tenant users can create orders"
         )
 
-    # 2. Find local user
+    # Find local user
+
     user = db.query(User).filter(
         User.id == o.user_id
     ).first()
@@ -474,9 +883,11 @@ def create_order(
             detail="User not found"
         )
 
-    # 3. Make sure logged-in Keycloak user
-    #    is ordering for himself
-    local_username = current_user.get("preferred_username")
+    # Logged-in Keycloak user
+
+    local_username = current_user.get(
+        "preferred_username"
+    )
 
     if user.username != local_username:
         raise HTTPException(
@@ -484,7 +895,6 @@ def create_order(
             detail="You can only create orders for yourself"
         )
 
-    # 4. Calculate order totals
     total_quantity = 0
     total_amount = 0
 
@@ -492,38 +902,35 @@ def create_order(
 
     for i in o.items:
 
-        # Find product
-        p = db.query(Product).filter(
+        product = db.query(Product).filter(
             Product.id == i.product_id
         ).first()
 
-        if not p:
+        if not product:
             raise HTTPException(
                 status_code=404,
                 detail=f"Product {i.product_id} not found"
             )
 
-        # Quantity must be positive
         if i.quantity <= 0:
             raise HTTPException(
                 status_code=400,
                 detail="Quantity must be greater than 0"
             )
 
-        # Check stock
-        if i.quantity > p.quantity:
+        if i.quantity >= product.quantity:
             raise HTTPException(
                 status_code=400,
-                detail=f"Not enough stock for {p.name}"
+                detail=f"Not enough stock for {product.name}"
             )
 
-        # Calculate totals
         total_quantity += i.quantity
-        total_amount += p.price * i.quantity
+        total_amount += product.price * i.quantity
 
-        items.append((p, i.quantity))
+        items.append(
+            (product, i.quantity)
+        )
 
-    # 5. Create order
     order = Order(
         user_id=user.id,
         total_quantity=total_quantity,
@@ -532,40 +939,183 @@ def create_order(
 
     db.add(order)
 
-    # Get order ID
     db.flush()
 
-    # 6. Create order items
-    for p, q in items:
+    for product, quantity in items:
 
-        # Reduce product stock
-        p.quantity -= q
+        product.quantity -= quantity
 
         item = OrderItem(
             order_id=order.id,
-            product_id=p.id,
-            quantity=q
+            product_id=product.id,
+            quantity=quantity
         )
 
         db.add(item)
 
-    # 7. Save everything
     db.commit()
 
-    # 8. Refresh order
     db.refresh(order)
 
     return order
 
-# get user history
-@app.get("/users/{user_id}/orders", response_model=list[OrderResponse])
+
+# =========================================================
+# MY ORDER
+# =========================================================
+
+@app.post("/orders/me")
+def create_my_order(
+    o: MyOrderCreate,
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    username = user.get(
+        "preferred_username"
+    )
+
+    if not username:
+        raise HTTPException(
+            status_code=401,
+            detail="Username not found in token"
+        )
+
+    db_user = db.query(User).filter(
+        User.username == username
+    ).first()
+
+    if not db_user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found in database"
+        )
+
+    total_quantity = 0
+    total_amount = 0
+
+    items = []
+
+    for i in o.items:
+
+        product = db.query(Product).filter(
+            Product.id == i.product_id
+        ).first()
+
+        if not product:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Product {i.product_id} not found"
+            )
+
+        if i.quantity <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Quantity must be greater than 0"
+            )
+
+        if i.quantity >= product.quantity:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not enough stock for {product.name}"
+            )
+
+        total_quantity += i.quantity
+        total_amount += product.price * i.quantity
+
+        items.append(
+            (product, i.quantity)
+        )
+
+    order = Order(
+        user_id=db_user.id,
+        total_quantity=total_quantity,
+        total_amount=total_amount
+    )
+
+    db.add(order)
+
+    db.flush()
+
+    for product, quantity in items:
+
+        product.quantity -= quantity
+
+        item = OrderItem(
+            order_id=order.id,
+            product_id=product.id,
+            quantity=quantity
+        )
+
+        db.add(item)
+
+    db.commit()
+
+    db.refresh(order)
+
+    return {
+        "message": "Order created successfully",
+        "order_id": order.id,
+        "total_quantity": order.total_quantity,
+        "total_amount": order.total_amount
+    }
+
+
+# =========================================================
+# MY ORDER HISTORY
+# =========================================================
+
+@app.get("/orders/me", response_model=list[OrderResponse])
+def get_my_orders(
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    username = user.get(
+        "preferred_username"
+    )
+
+    if not username:
+        raise HTTPException(
+            status_code=401,
+            detail="Username not found in token"
+        )
+
+    db_user = db.query(User).filter(
+        User.username == username
+    ).first()
+
+    if not db_user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found in database"
+        )
+
+    orders = db.query(Order).filter(
+        Order.user_id == db_user.id
+    ).all()
+
+    return orders
+
+
+# =========================================================
+# USER ORDER HISTORY
+# =========================================================
+
+@app.get(
+    "/users/{user_id}/orders",
+    response_model=list[OrderResponse]
+)
 def get_order_history(
     user_id: int,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user)
 ):
-    # Check Keycloak role
-    roles = current_user.get("realm_access", {}).get("roles", [])
+    roles = current_user.get(
+        "realm_access",
+        {}
+    ).get(
+        "roles",
+        []
+    )
 
     if "user" not in roles and "tenant" not in roles:
         raise HTTPException(
@@ -573,7 +1123,6 @@ def get_order_history(
             detail="Only users and tenant users can view orders"
         )
 
-    # Find local user
     user = db.query(User).filter(
         User.id == user_id
     ).first()
@@ -584,8 +1133,9 @@ def get_order_history(
             detail="User not found"
         )
 
-    # Logged-in user can see only their own orders
-    local_username = current_user.get("preferred_username")
+    local_username = current_user.get(
+        "preferred_username"
+    )
 
     if user.username != local_username:
         raise HTTPException(
@@ -593,72 +1143,92 @@ def get_order_history(
             detail="You can only view your own orders"
         )
 
-    # Get user's orders
     orders = db.query(Order).filter(
         Order.user_id == user_id
     ).all()
 
     return orders
 
+
+# =========================================================
+# CURRENT USER
+# =========================================================
+
 @app.get("/me")
-def get_me(user=Depends(get_current_user)):
-    return {
-        "username": user.get("preferred_username"),
-        "email": user.get("email"),
-        "roles": user.get("realm_access", {}).get("roles", [])
-    }
-
-# admin test
-@app.get("/admin-test")
-def admin_test(user=Depends(require_role("admin"))):
-    return {
-        "message": "You are an admin",
-        "username": user.get("preferred_username")
-    }
-
-
-@app.delete("/users/{user_id}")
-def delete_user(
-    user_id: int,
-    db: Session = Depends(get_db),
-    current_user=Depends(require_role("admin"))
+def get_me(
+    user=Depends(get_current_user)
 ):
-    # Find local user
-    user = db.query(User).filter(
-        User.id == user_id
+    return {
+        "username": user.get(
+            "preferred_username"
+        ),
+        "email": user.get(
+            "email"
+        ),
+        "roles": user.get(
+            "realm_access",
+            {}
+        ).get(
+            "roles",
+            []
+        )
+    }
+
+@app.get("/my-tenant")
+def get_my_tenant(
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    username = user.get("preferred_username")
+
+    if not username:
+        raise HTTPException(
+            status_code=401,
+            detail="Username not found in token"
+        )
+
+    local_user = db.query(User).filter(
+        User.username == username
     ).first()
 
-    if not user:
+    if not local_user:
         raise HTTPException(
             status_code=404,
-            detail="User not found"
+            detail="User not found in database"
         )
 
-    # Don't allow admin to delete an admin user
-    role = db.query(Role).filter(
-        Role.id == user.role_id
+    if local_user.tenant_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="User is not linked to any tenant"
+        )
+
+    tenant = db.query(Tenant).filter(
+        Tenant.id == local_user.tenant_id
     ).first()
 
-    if role and role.name == "admin":
+    if not tenant:
         raise HTTPException(
-            status_code=400,
-            detail="Admin user cannot be deleted"
+            status_code=404,
+            detail="Tenant not found"
         )
-
-    # Delete from Keycloak
-    try:
-        delete_keycloak_user(user.username)
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e)
-        )
-
-    # Delete from local database
-    db.delete(user)
-    db.commit()
 
     return {
-        "message": "User deleted successfully",
-        "username": user.username
+        "tenant_id": tenant.id,
+        "tenant_name": tenant.name
+    }
+
+# =========================================================
+# ADMIN TEST
+# =========================================================
+
+@app.get("/admin-test")
+def admin_test(
+    user=Depends(require_role("admin"))
+):
+    return {
+        "message": "You are an admin",
+        "username": user.get(
+            "preferred_username"
+        )
     }

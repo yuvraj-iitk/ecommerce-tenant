@@ -11,6 +11,10 @@ ADMIN_USERNAME = os.getenv("KEYCLOAK_ADMIN_USERNAME")
 ADMIN_PASSWORD = os.getenv("KEYCLOAK_ADMIN_PASSWORD")
 
 
+# =========================================================
+# GET KEYCLOAK ADMIN TOKEN
+# =========================================================
+
 def get_admin_token():
     url = f"{KEYCLOAK_URL}/realms/master/protocol/openid-connect/token"
 
@@ -24,12 +28,19 @@ def get_admin_token():
     response = requests.post(url, data=data)
 
     if response.status_code != 200:
-        raise Exception("Could not get Keycloak admin token")
+        raise Exception(
+            f"Could not get Keycloak admin token: {response.text}"
+        )
 
     return response.json()["access_token"]
 
 
-def create_keycloak_user(username, password):
+# =========================================================
+# CREATE KEYCLOAK USER
+# =========================================================
+
+def create_keycloak_user(username, password, role_name=None):
+
     token = get_admin_token()
 
     url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/users"
@@ -56,6 +67,7 @@ def create_keycloak_user(username, password):
         ]
     }
 
+    # Create user
     response = requests.post(
         url,
         headers=headers,
@@ -67,10 +79,92 @@ def create_keycloak_user(username, password):
             f"Keycloak user creation failed: {response.text}"
         )
 
+    # =====================================================
+    # GET CREATED USER ID
+    # =====================================================
+
+    search_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/users"
+
+    search_response = requests.get(
+        search_url,
+        headers=headers,
+        params={
+            "username": username,
+            "exact": "true"
+        }
+    )
+
+    if search_response.status_code != 200:
+        raise Exception(
+            f"Could not find created Keycloak user: "
+            f"{search_response.text}"
+        )
+
+    users = search_response.json()
+
+    if not users:
+        raise Exception(
+            "User was created but could not be found"
+        )
+
+    keycloak_user_id = users[0]["id"]
+
+    # =====================================================
+    # ASSIGN REALM ROLE
+    # =====================================================
+
+    if role_name:
+
+        role_url = (
+            f"{KEYCLOAK_URL}/admin/realms/"
+            f"{REALM}/roles/{role_name}"
+        )
+
+        role_response = requests.get(
+            role_url,
+            headers=headers
+        )
+
+        if role_response.status_code != 200:
+            raise Exception(
+                f"Keycloak role '{role_name}' not found: "
+                f"{role_response.text}"
+            )
+
+        role = role_response.json()
+
+        mapping_url = (
+            f"{KEYCLOAK_URL}/admin/realms/"
+            f"{REALM}/users/{keycloak_user_id}/"
+            f"role-mappings/realm"
+        )
+
+        mapping_response = requests.post(
+            mapping_url,
+            headers=headers,
+            json=[
+                {
+                    "id": role["id"],
+                    "name": role["name"]
+                }
+            ]
+        )
+
+        if mapping_response.status_code != 204:
+            raise Exception(
+                f"Could not assign role '{role_name}': "
+                f"{mapping_response.text}"
+            )
+
     return True
 
 
+# =========================================================
+# DELETE KEYCLOAK USER
+# =========================================================
+
 def delete_keycloak_user(username):
+
     token = get_admin_token()
 
     search_url = f"{KEYCLOAK_URL}/admin/realms/{REALM}/users"
@@ -82,7 +176,10 @@ def delete_keycloak_user(username):
     response = requests.get(
         search_url,
         headers=headers,
-        params={"username": username, "exact": "true"}
+        params={
+            "username": username,
+            "exact": "true"
+        }
     )
 
     if response.status_code != 200:

@@ -1,0 +1,10 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: ecommerce-keycloak
+    command: start-dev
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin123
+    ports:
+      - "8080:8080"
