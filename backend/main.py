@@ -114,7 +114,8 @@ def create_tenant(
 
 @app.get("/tenants")
 def get_tenants(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user=Depends(require_role("admin"))
 ):
     return db.query(Tenant).all()
 
